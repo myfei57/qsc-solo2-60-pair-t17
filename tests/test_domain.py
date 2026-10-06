@@ -11,7 +11,7 @@ from waterplant.chlor import Doser as ChlorDoser
 from waterplant.chlor import validate_demand
 from waterplant.clearwell import Well, validate_level
 from waterplant.coag import Doser as CoagDoser
-from waterplant.filter import Bank, validate_zone
+from waterplant.filter import Bank, RotationService, validate_zone
 from waterplant.flow import Calibration, calibrate_meter, validate_factor
 from waterplant.intake import FlowRepository, InletController, Sensor, mix, validate_flow
 from waterplant.intake import Trend
@@ -246,6 +246,103 @@ class FilterCase(unittest.TestCase):
         bank.remove_bed("b1")
         self.assertEqual(bank.count(), 2)
 
+    def test_rotation_uses_load_then_last_backwash_and_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = Bank()
+            controller = Controller(bank, store, clock=lambda: 1000)
+            auditor = Auditor(store)
+            service = RotationService(bank, controller, auditor, clock=lambda: 5000)
+
+            bank.add_bed("b1", 1, 10.0)
+            bank.add_bed("b2", 2, 9.5)
+            bank.add_bed("b3", 3, 9.0)
+            bank.record_production("b2", 50.0)
+            bank.record_production("b3", 25.0)
+            controller.start("b1")
+            controller.finish("b1")
+
+            result = service.rotate()
+            self.assertEqual(result.on_duty, "b3")
+            self.assertEqual(bank.on_duty(), "b3")
+            self.assertIn("older last backwash", result.reason)
+            self.assertEqual(auditor.last().kind, "rotation")
+
+            result = service.rotate()
+            self.assertTrue(result.idempotent)
+            self.assertEqual(auditor.count(), 1)
+
+    def test_rotation_holds_incumbent_when_loads_are_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = Bank()
+            service = RotationService(bank, Controller(bank, store), Auditor(store), clock=lambda: 2000)
+            bank.add_bed("b1", 1, 10.0)
+            bank.add_bed("b2", 2, 10.5)
+            bank.rotate("b1", now=100)
+
+            result = service.rotate()
+            self.assertEqual(result.on_duty, "b1")
+            self.assertTrue(result.idempotent)
+            self.assertIn("load within tie tolerance", result.reason)
+
+    def test_rotation_holds_recent_duty_bed_inside_tie_band(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = Bank()
+            service = RotationService(bank, Controller(bank, store), Auditor(store), clock=lambda: 2000)
+            bank.add_bed("b1", 1, 10.0)
+            bank.add_bed("b2", 2, 10.0)
+            bank.rotate("b1", now=1900)
+
+            result = service.rotate()
+            self.assertEqual(result.on_duty, "b1")
+            self.assertIn("cooldown", result.reason)
+
+    def test_rotation_partial_read_keeps_duty_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = Bank()
+            bank.add_bed("b1", 1, 10.0)
+            bank.add_bed("b2", 2, 5.0)
+            bank.rotate("b1")
+            auditor = Auditor(store)
+            service = RotationService(bank, Controller(bank, store), auditor, clock=lambda: 3000)
+
+            first = service.rotate({"b1": None, "b2": 5.0})
+            self.assertFalse(first.changed)
+            self.assertEqual(first.on_duty, "b1")
+            self.assertFalse(first.available)
+            audit_count = auditor.count()
+
+            second = service.rotate({"b1": None, "b2": 5.0})
+            self.assertEqual(second.on_duty, "b1")
+            self.assertEqual(bank.on_duty(), "b1")
+            self.assertEqual(auditor.count(), audit_count)
+
+            recovered = service.rotate({"b1": 10.0, "b2": 5.0})
+            self.assertTrue(recovered.idempotent)
+            self.assertEqual(recovered.on_duty, "b1")
+
+    def test_production_accumulates_for_backwash_cycle_and_resets_on_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store.open(f"{tmp}/state.json")
+            bank = Bank()
+            controller = Controller(bank, store, clock=lambda: 1000)
+            bank.add_bed("b1", 1, 4.0)
+            bank.record_production("b1", 10.0)
+            bank.record_production("b1", 5.0)
+            self.assertEqual(bank.bed("b1").cycle_production, 15.0)
+
+            controller.start("b1")
+            self.assertIsNone(bank.on_duty())
+            with self.assertRaises(ValueError):
+                bank.rotate("b1")
+            controller.finish("b1")
+            self.assertEqual(bank.bed("b1").cycle_production, 0.0)
+            self.assertFalse(bank.is_closed("b1"))
+            self.assertEqual(bank.bed("b1").last_backwash, 1000)
+
     def test_unknown_bed_raises(self) -> None:
         bank = Bank()
         with self.assertRaises(ValueError):
@@ -272,7 +369,7 @@ class BackwashCase(unittest.TestCase):
             store = Store.open(f"{tmp}/state.json")
             bank = Bank()
             bank.add_bed("b1", 1, 4.0)
-            controller = Controller(bank, store)
+            controller = Controller(bank, store, clock=lambda: 1000)
             controller.start("b1")
             self.assertTrue(bank.is_closed("b1"))
             self.assertFalse(controller.spilled())
@@ -286,13 +383,16 @@ class BackwashCase(unittest.TestCase):
             bank = Bank()
             bank.add_bed("b1", 1, 4.0)
             bank.add_bed("b2", 2, 2.0)
-            controller = Controller(bank, store)
+            controller = Controller(bank, store, clock=lambda: 1000)
             controller.enqueue("b1")
             controller.enqueue("b2")
             self.assertEqual(controller.pending_count(), 2)
             self.assertEqual(controller.replay(), ["b1", "b2"])
             self.assertTrue(bank.is_closed("b1"))
+            self.assertTrue(bank.is_closed("b2"))
             controller.recover()
+            self.assertFalse(bank.is_closed("b1"))
+            self.assertFalse(bank.is_closed("b2"))
             self.assertEqual(controller.command_list(), [])
 
     def test_rotation_and_selection(self) -> None:
@@ -301,7 +401,7 @@ class BackwashCase(unittest.TestCase):
             bank = Bank()
             bank.add_bed("b1", 1, 4.0)
             bank.add_bed("b2", 2, 9.0)
-            controller = Controller(bank, store)
+            controller = Controller(bank, store, clock=lambda: 1000)
             self.assertEqual(controller.order_rotation(), ["b2", "b1"])
             self.assertEqual(bank.on_duty(), "b2")
             self.assertEqual(controller.select(1), "b1")

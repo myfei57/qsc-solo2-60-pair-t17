@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
+from contextlib import contextmanager
+from typing import Iterator
 
 from .bed import Bed
 from .report import BankState, BedState
@@ -18,6 +21,13 @@ class Bank:
     def __init__(self) -> None:
         self._beds: dict[str, Bed] = {}
         self._lock = threading.RLock()
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        """Hold the bank state across a multi-component operation."""
+
+        with self._lock:
+            yield
 
     def add_bed(self, bed_id: str, zone: int, load: float = 0.0) -> Bed:
         with self._lock:
@@ -45,7 +55,10 @@ class Bank:
 
     def open(self, bed_id: str) -> None:
         with self._lock:
-            self._require(bed_id).closed = False
+            bed = self._require(bed_id)
+            if bed.backwashing:
+                raise ValueError(f"filter bed {bed_id} is backwashing")
+            bed.closed = False
 
     def is_closed(self, bed_id: str) -> bool:
         with self._lock:
@@ -54,11 +67,43 @@ class Bank:
     def reset_closed(self) -> None:
         with self._lock:
             for bed in self._beds.values():
-                bed.closed = False
+                if not bed.backwashing:
+                    bed.closed = False
 
     def set_load(self, bed_id: str, load: float) -> None:
         with self._lock:
             self._require(bed_id).load = load
+
+    def record_production(self, bed_id: str, amount: float) -> float:
+        if amount < 0 or not math.isfinite(amount):
+            raise ValueError("production amount must be a finite non-negative number")
+        with self._lock:
+            bed = self._require(bed_id)
+            bed.cycle_production += amount
+            return bed.cycle_production
+
+    def begin_backwash(self, bed_id: str) -> None:
+        """Close the bed and remove duty as one in-memory transition."""
+
+        with self._lock:
+            bed = self._require(bed_id)
+            bed.backwashing = True
+            bed.closed = True
+            bed.duty = False
+
+    def complete_backwash(self, bed_id: str, finished_at: int) -> None:
+        """Open the bed and reset the fixed per-backwash production cycle."""
+
+        with self._lock:
+            bed = self._require(bed_id)
+            bed.backwashing = False
+            bed.closed = False
+            bed.cycle_production = 0.0
+            bed.last_backwash = finished_at
+
+    def is_backwashing(self, bed_id: str) -> bool:
+        with self._lock:
+            return self._require(bed_id).backwashing
 
     def renumber(self, bed_id: str, zone: int) -> None:
         with self._lock:
@@ -77,14 +122,18 @@ class Bank:
                 return 0, False
             return bed.zone, True
 
-    def rotate(self, bed_id: str) -> None:
-        """Give the duty flag to one bed and clear it everywhere else."""
+    def rotate(self, bed_id: str, now: int | None = None) -> None:
+        """Give the duty flag to one available bed and clear it elsewhere."""
 
         with self._lock:
-            self._require(bed_id)
+            target = self._require(bed_id)
+            if target.closed or target.backwashing:
+                raise ValueError(f"filter bed {bed_id} is not available for duty")
             for bed in self._beds.values():
                 bed.duty = False
-            self._beds[bed_id].duty = True
+            target.duty = True
+            if now is not None:
+                target.last_duty = now
 
     def on_duty(self) -> str | None:
         with self._lock:
@@ -128,6 +177,10 @@ class Bank:
                     load=bed.load,
                     closed=bed.closed,
                     duty=bed.duty,
+                    backwashing=bed.backwashing,
+                    cycle_production=bed.cycle_production,
+                    last_backwash=bed.last_backwash,
+                    last_duty=bed.last_duty,
                 )
                 for bed in beds
             ],

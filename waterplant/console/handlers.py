@@ -199,6 +199,20 @@ def filter_load(server: "Server", request: Request) -> Response:
     return json_response({"id": bed_id, "load": load})
 
 
+def filter_production(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    amount = request.float_field("amount")
+    if amount < 0 or amount in (float("inf"), float("-inf")) or amount != amount:
+        raise ValueError("production amount must be a finite non-negative number")
+    total = server.runtime.bank.record_production(bed_id, amount)
+    return json_response({"id": bed_id, "amount": amount, "cycle_production": total})
+
+
+def filter_rotate(server: "Server", request: Request) -> Response:
+    result = server.runtime.rotation.rotate()
+    return json_response(result.as_dict(), 200 if result.available else 503)
+
+
 def filter_reset(server: "Server", request: Request) -> Response:
     server.runtime.bank.reset_closed()
     return json_response({"reset": True})
@@ -222,10 +236,26 @@ def backwash_start(server: "Server", request: Request) -> Response:
     return json_response({"started": bed_id})
 
 
+def backwash_finish(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    server.runtime.backwash.finish(bed_id)
+    bed = server.runtime.bank.bed(bed_id)
+    return json_response(
+        {
+            "finished": bed_id,
+            "active": False,
+            "closed": bed.closed,
+            "cycle_production": bed.cycle_production,
+            "last_backwash": bed.last_backwash,
+        }
+    )
+
+
 def backwash_order(server: "Server", request: Request) -> Response:
     runtime = server.runtime
-    order = runtime.backwash.order_rotation()
-    return json_response({"order": order, "on_duty": runtime.bank.on_duty() or ""})
+    result = runtime.rotation.rotate()
+    payload = result.as_dict()
+    return json_response(payload, 200 if result.available else 503)
 
 
 def backwash_select(server: "Server", request: Request) -> Response:

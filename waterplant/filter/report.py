@@ -14,6 +14,10 @@ class BedState:
     load: float
     closed: bool
     duty: bool
+    backwashing: bool
+    cycle_production: float
+    last_backwash: int
+    last_duty: int
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -22,6 +26,10 @@ class BedState:
             "load": self.load,
             "closed": self.closed,
             "duty": self.duty,
+            "backwashing": self.backwashing,
+            "cycle_production": self.cycle_production,
+            "last_backwash": self.last_backwash,
+            "last_duty": self.last_duty,
         }
 
 

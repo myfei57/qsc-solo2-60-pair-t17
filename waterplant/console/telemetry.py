@@ -18,6 +18,8 @@ class Telemetry:
     backwash_queue: int
     backwash_drains: int
     last_drain: str
+    rotation_reason: str
+    rotation_on_duty: str
     audit_entries: int
     quota_value: float
     clearwell_level: float
@@ -40,6 +42,8 @@ class Telemetry:
             "backwash_queue": self.backwash_queue,
             "backwash_drains": self.backwash_drains,
             "last_drain": self.last_drain,
+            "rotation_reason": self.rotation_reason,
+            "rotation_on_duty": self.rotation_on_duty,
             "audit_entries": self.audit_entries,
             "quota_value": self.quota_value,
             "clearwell_level": self.clearwell_level,
@@ -58,6 +62,7 @@ class Telemetry:
 def collect(rt: Runtime) -> Telemetry:
     """Read every counter without mutating the control state."""
 
+    rotation = rt.rotation.last_result()
     return Telemetry(
         store_keys=rt.store.count(),
         filter_beds=rt.bank.count(),
@@ -66,6 +71,8 @@ def collect(rt: Runtime) -> Telemetry:
         backwash_queue=rt.backwash.pending_count(),
         backwash_drains=rt.backwash.drain_count(),
         last_drain=rt.backwash.last_drain() or "",
+        rotation_reason=rotation.reason if rotation is not None else "",
+        rotation_on_duty=(rotation.on_duty or "") if rotation is not None else "",
         audit_entries=rt.auditor.count(),
         quota_value=rt.accumulator.value(),
         clearwell_level=rt.well.level(),

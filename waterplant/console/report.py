@@ -36,6 +36,10 @@ def text_report(rt: Runtime) -> str:
             f"total_load={telemetry.filter_load:.4f}"
         ),
         f"filter bed_ids={rt.bank.bed_ids()}",
+        (
+            f"rotation on_duty={rt.bank.on_duty() or ''} "
+            f"reason={(rt.rotation.last_result().reason if rt.rotation.last_result() else '')}"
+        ),
         f"backwash queue={telemetry.backwash_queue} drains={telemetry.backwash_drains}",
         f"backwash commands={rt.backwash.command_list()}",
         f"quota value={telemetry.quota_value:.4f} clearwell level={telemetry.clearwell_level:.4f}",

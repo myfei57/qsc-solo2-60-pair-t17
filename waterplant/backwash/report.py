@@ -11,6 +11,13 @@ class BackwashState:
 
     commands: list[str]
     drains: list[str]
+    active: list[str]
+    history: list[str]
 
     def as_dict(self) -> dict[str, object]:
-        return {"commands": self.commands, "drains": self.drains}
+        return {
+            "commands": self.commands,
+            "drains": self.drains,
+            "active": self.active,
+            "history": self.history,
+        }

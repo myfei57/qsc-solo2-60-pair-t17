@@ -37,10 +37,11 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     rt.well.update_residual_demand(demand)
     chlor_dose = rt.chlor_doser.apply_residual() if ph_verdict.stable else 0.0
     min_level = rt.well.adjust_level(level, rt.inlet, rt.outlet)
-    rotation = rt.backwash.order_rotation()
-    duty = rt.bank.on_duty()
     if bed_id:
         rt.backwash.start(bed_id)
+    rotation_result = rt.rotation.rotate()
+    rotation = rotation_result.order
+    duty = rotation_result.on_duty
     quota_value = rt.accumulator.add(amount)
 
     return json_response(
@@ -52,11 +53,13 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "level": rt.well.level(),
             "quota": quota_value,
             "rotation": rotation,
+            "rotation_reason": rotation_result.reason,
             "on_duty": duty or "",
             "backwash": bed_id,
             "drains": rt.backwash.drain_count(),
             "audit_count": rt.auditor.count(),
             "ph_stable": ph_verdict.stable,
             "ph_adjustment": ph_verdict.adjustment,
-        }
+        },
+        503 if rotation_result.reason.startswith("rotation state unavailable") else 200,
     )

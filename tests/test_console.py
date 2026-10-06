@@ -18,6 +18,9 @@ class ConsoleCase(unittest.TestCase):
         self.store = Store.open(f"{self._tmp.name}/state.json")
         seed_defaults(self.store)
         self.server = Server(self.store)
+        self._clock = 2_000
+        self.server.runtime.backwash._clock = lambda: self._clock
+        self.server.runtime.rotation._clock = lambda: self._clock
 
     def tearDown(self) -> None:
         self.store.close()
@@ -58,6 +61,7 @@ class ConsoleCase(unittest.TestCase):
                 "coag",
                 "chlor",
                 "filter",
+                "rotation",
                 "backwash",
                 "turbidity",
                 "flow",
@@ -159,7 +163,7 @@ class ConsoleCase(unittest.TestCase):
         status, body = self.call("POST", "/filter/close", {"id": "b1"})
         self.assertEqual(body["closed"], "b1")
         status, body = self.call("GET", "/backwash/order")
-        self.assertEqual(body["order"], ["b2", "b1", "b3"])
+        self.assertEqual(body["order"], ["b2", "b3"])
         self.assertEqual(body["on_duty"], "b2")
 
         status, body = self.call("POST", "/backwash/select", {"zone": 3})
@@ -176,11 +180,51 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         _, body = self.call("POST", "/backwash/replay")
         self.assertEqual(body["replayed"], ["b1"])
-        status, _ = self.call("POST", "/backwash/recover")
+        status, body = self.call("POST", "/backwash/recover")
         self.assertEqual(status, 200)
 
         status, body = self.call("POST", "/filter/load", {"id": "b1", "load": 20.0})
         self.assertEqual(body["load"], 20.0)
+        status, body = self.call("POST", "/filter/production", {"id": "b1", "amount": 12.5})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["cycle_production"], 12.5)
+        self.call("POST", "/filter/load", {"id": "b1", "load": 9.5})
+        status, _ = self.call("POST", "/backwash/start", {"id": "b1"})
+        self.assertEqual(status, 200)
+        self._clock = 5_000
+        status, body = self.call("GET", "/backwash/order")
+        self.assertEqual(body["order"], ["b2", "b3"])
+        self.assertEqual(body["on_duty"], "b2")
+        self.assertIn("backwashing", body["reason"])
+        _, body = self.call("POST", "/backwash/finish", {"id": "b1"})
+        self.assertFalse(body["active"])
+        self.assertEqual(body["cycle_production"], 0.0)
+        self.assertFalse(body["closed"])
+
+        status, body = self.call("POST", "/filter/rotate", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["idempotent"])
+        self.assertIn("reason", body)
+        self.call("POST", "/backwash/start", {"id": "b1"})
+        self._clock = 8_000
+        status, body = self.call("GET", "/backwash/order")
+        self.assertEqual(body["on_duty"], "b2")
+        self.server.runtime.backwash.finish("b1")
+        status, body = self.call("POST", "/filter/rotate", {})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["idempotent"])
+
+        self.store.put("backwash:drain:b2", "{broken")
+        status, body = self.call("GET", "/backwash/order")
+        self.assertEqual(status, 503)
+        self.assertEqual(body["on_duty"], "b2")
+        self.assertIn("state unavailable", body["reason"])
+        repeat_count = self.store.count()
+        status, _ = self.call("GET", "/backwash/order")
+        self.assertEqual(status, 503)
+        self.assertEqual(self.store.count(), repeat_count)
+        self.store.delete("backwash:drain:b2")
+
         status, _ = self.call("POST", "/filter/reset")
         self.assertEqual(status, 200)
         status, _ = self.call("POST", "/filter/open", {"id": "b1"})
@@ -226,7 +270,8 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["coag_dose"], 800.0)
         self.assertEqual(body["turb_dose"], 3.0)
         self.assertEqual(body["chlor_dose"], 0.65)
-        self.assertEqual(body["rotation"], ["b1"])
+        self.assertEqual(body["rotation"], [])
+        self.assertEqual(body["on_duty"], "")
         self.assertEqual(body["drains"], 1)
         self.assertEqual(body["audit_count"], 2)
         self.assertTrue(body["ph_stable"])
