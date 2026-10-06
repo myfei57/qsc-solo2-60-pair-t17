@@ -86,6 +86,13 @@ class Bank:
                 bed.duty = False
             self._beds[bed_id].duty = True
 
+    def clear_duty(self) -> None:
+        """Release the duty flag from every bed."""
+
+        with self._lock:
+            for bed in self._beds.values():
+                bed.duty = False
+
     def on_duty(self) -> str | None:
         with self._lock:
             for bed_id, bed in self._beds.items():

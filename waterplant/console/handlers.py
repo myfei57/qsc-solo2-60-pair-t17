@@ -14,6 +14,7 @@ from waterplant.ns import Stage, treatment_line
 from waterplant.ph import validate_ph
 from waterplant.quota import Quota, check_quota, validate_amount
 from waterplant.reporting import audit_export, telemetry_export, to_csv
+from waterplant.rotation import validate_min_dwell, validate_production, validate_tolerance
 from waterplant.scheduler import validate_threshold
 from waterplant.store import export_state
 
@@ -172,6 +173,7 @@ def filter_add(server: "Server", request: Request) -> Response:
 
 def filter_close(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
+    server.runtime.rotation.release_if_duty(bed_id, reason="bed closed")
     server.runtime.bank.close(bed_id)
     return json_response({"closed": bed_id})
 
@@ -206,6 +208,7 @@ def filter_reset(server: "Server", request: Request) -> Response:
 
 def filter_remove(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
+    server.runtime.rotation.release_if_duty(bed_id, reason="bed removed")
     server.runtime.bank.remove_bed(bed_id)
     return json_response({"removed": bed_id})
 
@@ -218,14 +221,14 @@ def filter_zone(server: "Server", request: Request) -> Response:
 
 def backwash_start(server: "Server", request: Request) -> Response:
     bed_id = request.str_field("id")
+    server.runtime.rotation.release_if_duty(bed_id)
     server.runtime.backwash.start(bed_id)
     return json_response({"started": bed_id})
 
 
 def backwash_order(server: "Server", request: Request) -> Response:
     runtime = server.runtime
-    order = runtime.backwash.order_rotation()
-    return json_response({"order": order, "on_duty": runtime.bank.on_duty() or ""})
+    return json_response({"order": runtime.rotation.ranked(), "on_duty": runtime.bank.on_duty() or ""})
 
 
 def backwash_select(server: "Server", request: Request) -> Response:
@@ -247,6 +250,43 @@ def backwash_recover(server: "Server", request: Request) -> Response:
 
 def backwash_replay(server: "Server", request: Request) -> Response:
     return json_response({"replayed": server.runtime.backwash.replay()})
+
+
+def rotation_state(server: "Server", request: Request) -> Response:
+    return json_response(server.runtime.rotation.state().as_dict())
+
+
+def rotation_run(server: "Server", request: Request) -> Response:
+    trigger = request.str_field("trigger") or "manual"
+    return json_response(server.runtime.rotation.evaluate(trigger=trigger).as_dict())
+
+
+def rotation_production(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    amount = request.float_field("amount")
+    validate_production(amount)
+    total = server.runtime.rotation.record_production(bed_id, amount)
+    return json_response({"id": bed_id, "production": total})
+
+
+def rotation_production_reset(server: "Server", request: Request) -> Response:
+    bed_id = request.str_field("id")
+    server.runtime.rotation.reset_production(bed_id or None)
+    return json_response({"reset": True, "id": bed_id})
+
+
+def rotation_min_dwell(server: "Server", request: Request) -> Response:
+    seconds = request.float_field("seconds")
+    validate_min_dwell(seconds)
+    value = server.runtime.rotation.set_min_dwell_seconds(seconds)
+    return json_response({"min_dwell_seconds": value})
+
+
+def rotation_tolerance(server: "Server", request: Request) -> Response:
+    tolerance = request.float_field("tolerance")
+    validate_tolerance(tolerance)
+    value = server.runtime.rotation.set_load_tolerance(tolerance)
+    return json_response({"load_tolerance": value})
 
 
 def quota_add(server: "Server", request: Request) -> Response:

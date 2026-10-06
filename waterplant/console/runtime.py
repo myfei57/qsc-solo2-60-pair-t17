@@ -13,6 +13,7 @@ from waterplant.intake import FlowRepository, InletController, Trend
 from waterplant.inventory import Inventory
 from waterplant.ph import Stabilizer
 from waterplant.quota import Accumulator
+from waterplant.rotation import Rotation
 from waterplant.scheduler import Scheduler
 from waterplant.store import Store
 from waterplant.turb import Sampler
@@ -37,6 +38,7 @@ class Runtime:
         self.well = Well(store)
         self.accumulator = Accumulator(store)
         self.auditor = Auditor(store)
+        self.rotation = Rotation(bank, store, self.auditor)
         self.stabilizer = Stabilizer(store)
         self.scheduler = Scheduler(store)
         self.trend = Trend(store)

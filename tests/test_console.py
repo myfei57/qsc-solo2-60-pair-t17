@@ -59,6 +59,7 @@ class ConsoleCase(unittest.TestCase):
                 "chlor",
                 "filter",
                 "backwash",
+                "rotation",
                 "turbidity",
                 "flow",
                 "clearwell",
@@ -158,8 +159,12 @@ class ConsoleCase(unittest.TestCase):
 
         status, body = self.call("POST", "/filter/close", {"id": "b1"})
         self.assertEqual(body["closed"], "b1")
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["action"], "assign")
+        self.assertEqual(body["duty"], "b2")
         status, body = self.call("GET", "/backwash/order")
-        self.assertEqual(body["order"], ["b2", "b1", "b3"])
+        self.assertEqual(body["order"], ["b2", "b3"])
         self.assertEqual(body["on_duty"], "b2")
 
         status, body = self.call("POST", "/backwash/select", {"zone": 3})
@@ -187,6 +192,86 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(status, 200)
         status, body = self.call("POST", "/filter/remove", {"id": "b3"})
         self.assertEqual(body["removed"], "b3")
+
+    def test_rotation_routes(self) -> None:
+        for bed_id, zone, load in (("b1", 1, 5.0), ("b2", 2, 5.2), ("b3", 3, 1.0)):
+            status, _ = self.call(
+                "POST", "/filter/add", {"id": bed_id, "zone": zone, "load": load}
+            )
+            self.assertEqual(status, 200)
+
+        status, body = self.call("POST", "/rotation/production", {"id": "b2", "amount": 50.0})
+        self.assertEqual(body["production"], 50.0)
+
+        # Loads 5.0 and 5.2 are within the default tolerance: the bed with
+        # less cumulative production takes duty.
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["action"], "assign")
+        self.assertEqual(body["duty"], "b1")
+        self.assertIn("production", body["reason"])
+
+        status, body = self.call("GET", "/rotation")
+        self.assertEqual(body["duty"], "b1")
+        self.assertEqual(len(body["candidates"]), 3)
+        self.assertEqual(body["last_decision"]["action"], "assign")
+        self.assertEqual(body["min_dwell_seconds"], 300.0)
+
+        # Repeating the trigger with unchanged state is a no-op.
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(body["action"], "hold")
+        self.assertFalse(body["changed"])
+        status, body = self.call("GET", "/audit/summary")
+        self.assertEqual(body["by_kind"], {"rotation": 1})
+
+        status, body = self.call("POST", "/rotation/min-dwell", {"seconds": 0})
+        self.assertEqual(body["min_dwell_seconds"], 0.0)
+        self.call("POST", "/filter/load", {"id": "b3", "load": 9.0})
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(body["action"], "switch")
+        self.assertEqual(body["duty"], "b3")
+
+        status, body = self.call("POST", "/rotation/tolerance", {"tolerance": 0.1})
+        self.assertEqual(body["load_tolerance"], 0.1)
+
+        # An unreadable bed status is a partial failure: duty stays put.
+        self.store.put("rotation:produced:b1", "corrupt")
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(body["action"], "blocked")
+        self.assertFalse(body["changed"])
+        self.assertEqual(body["duty"], "b3")
+        status, body = self.call("GET", "/rotation")
+        self.assertEqual(body["last_decision"]["action"], "blocked")
+        self.assertEqual(body["duty"], "b3")
+
+        # Recovery: reset the counters, the next trigger evaluates again.
+        status, _ = self.call("POST", "/rotation/production/reset", {})
+        self.assertEqual(status, 200)
+        status, body = self.call("POST", "/rotation/run")
+        self.assertEqual(body["action"], "hold")
+        self.assertEqual(body["duty"], "b3")
+
+        # Backwashing the duty bed hands duty off before the wash starts.
+        status, _ = self.call("POST", "/backwash/start", {"id": "b3"})
+        self.assertEqual(status, 200)
+        status, body = self.call("GET", "/rotation")
+        self.assertEqual(body["duty"], "b2")
+        candidates = {candidate["id"]: candidate for candidate in body["candidates"]}
+        self.assertFalse(candidates["b3"]["eligible"])
+        status, body = self.call("GET", "/backwash/order")
+        self.assertEqual(body["order"], ["b2", "b1"])
+        self.assertEqual(body["on_duty"], "b2")
+
+        status, body = self.call("POST", "/audit/filter", {"kind": "rotation"})
+        self.assertEqual(len(body["entries"]), 3)
+        self.assertIn("handoff", body["entries"][-1]["detail"])
+
+        status, body = self.call("POST", "/rotation/production", {"id": "ghost", "amount": 1.0})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/rotation/production", {"id": "b1", "amount": -1.0})
+        self.assertEqual(status, 400)
+        status, body = self.call("POST", "/rotation/min-dwell", {"seconds": -1})
+        self.assertEqual(status, 400)
 
     def test_quota_and_audit_routes(self) -> None:
         status, body = self.call("POST", "/quota/add", {"amount": 40.0})
@@ -227,8 +312,10 @@ class ConsoleCase(unittest.TestCase):
         self.assertEqual(body["turb_dose"], 3.0)
         self.assertEqual(body["chlor_dose"], 0.65)
         self.assertEqual(body["rotation"], ["b1"])
+        self.assertEqual(body["rotation_action"], "assign")
+        self.assertEqual(body["on_duty"], "")
         self.assertEqual(body["drains"], 1)
-        self.assertEqual(body["audit_count"], 2)
+        self.assertEqual(body["audit_count"], 4)
         self.assertTrue(body["ph_stable"])
         self.assertEqual(body["ph_adjustment"], 0.0)
 

@@ -20,6 +20,7 @@ from waterplant.ns import Stage, treatment_line
 from waterplant.ph import Stabilizer, validate_ph
 from waterplant.quota import Accumulator, Quota, check_quota, validate_amount
 from waterplant.reporting import audit_export, to_csv
+from waterplant.rotation import Rotation
 from waterplant.scheduler import Scheduler, validate_threshold
 from waterplant.store import (
     Store,
@@ -295,19 +296,144 @@ class BackwashCase(unittest.TestCase):
             controller.recover()
             self.assertEqual(controller.command_list(), [])
 
-    def test_rotation_and_selection(self) -> None:
+    def test_selection_and_eligibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = Store.open(f"{tmp}/state.json")
             bank = Bank()
             bank.add_bed("b1", 1, 4.0)
             bank.add_bed("b2", 2, 9.0)
             controller = Controller(bank, store)
-            self.assertEqual(controller.order_rotation(), ["b2", "b1"])
-            self.assertEqual(bank.on_duty(), "b2")
             self.assertEqual(controller.select(1), "b1")
             self.assertEqual(controller.eligible(), ["b1", "b2"])
+            bank.close("b1")
+            self.assertEqual(controller.eligible(), ["b2"])
             with self.assertRaises(ValueError):
                 controller.select(7)
+
+
+class RotationCase(unittest.TestCase):
+    def _rig(self, tmp: str, loads: dict[str, float]) -> tuple[Store, Bank, Auditor, Rotation]:
+        store = Store.open(f"{tmp}/state.json")
+        bank = Bank()
+        for index, (bed_id, load) in enumerate(loads.items(), start=1):
+            bank.add_bed(bed_id, index, load)
+        auditor = Auditor(store)
+        return store, bank, auditor, Rotation(bank, store, auditor)
+
+    def test_load_dominates_outside_tolerance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, auditor, rotation = self._rig(tmp, {"b1": 4.0, "b2": 9.0})
+            decision = rotation.evaluate()
+            self.assertEqual(decision.action, "assign")
+            self.assertEqual(decision.duty, "b2")
+            self.assertEqual(bank.on_duty(), "b2")
+            self.assertIn("highest load", decision.reason)
+            again = rotation.evaluate()
+            self.assertEqual(again.action, "hold")
+            self.assertFalse(again.changed)
+            self.assertEqual(len(auditor.filter("rotation")), 1)
+
+    def test_production_breaks_load_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, rotation = self._rig(tmp, {"b1": 5.0, "b2": 5.2})
+            rotation.record_production("b1", 40.0)
+            rotation.record_production("b2", 10.0)
+            decision = rotation.evaluate()
+            self.assertEqual(decision.duty, "b2")
+            self.assertIn("production", decision.reason)
+            self.assertEqual(bank.on_duty(), "b2")
+
+    def test_wash_age_breaks_remaining_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, bank, _, rotation = self._rig(tmp, {"b1": 5.0, "b2": 5.0})
+            controller = Controller(bank, store)
+            controller.start("b1")
+            bank.open("b1")
+            decision = rotation.evaluate()
+            self.assertEqual(decision.duty, "b2")
+            self.assertIn("wash", decision.reason)
+
+    def test_dwell_blocks_rapid_switching(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, rotation = self._rig(tmp, {"b1": 5.0, "b2": 5.0})
+            self.assertEqual(rotation.evaluate().duty, "b1")
+            bank.set_load("b2", 9.0)
+            held = rotation.evaluate()
+            self.assertEqual(held.action, "hold")
+            self.assertEqual(held.duty, "b1")
+            self.assertIn("dwell", held.reason)
+            rotation.set_min_dwell_seconds(0.0)
+            moved = rotation.evaluate()
+            self.assertEqual(moved.action, "switch")
+            self.assertEqual(moved.duty, "b2")
+
+    def test_closed_bed_never_takes_duty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            bank.close("b1")
+            decision = rotation.evaluate()
+            self.assertEqual(decision.duty, "b2")
+            self.assertEqual(rotation.ranked(), ["b2"])
+
+    def test_duty_bed_entering_backwash_yields_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            self.assertEqual(rotation.evaluate().duty, "b1")
+            bank.close("b1")
+            decision = rotation.evaluate()
+            self.assertEqual(decision.action, "switch")
+            self.assertEqual(decision.duty, "b2")
+            self.assertIn("unavailable", decision.reason)
+
+    def test_partial_failure_keeps_duty_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, bank, auditor, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            self.assertEqual(rotation.evaluate().duty, "b1")
+            store.put("rotation:produced:b2", "not-json")
+            blocked = rotation.evaluate()
+            self.assertEqual(blocked.action, "blocked")
+            self.assertFalse(blocked.changed)
+            self.assertEqual(bank.on_duty(), "b1")
+            rotation.reset_production("b2")
+            recovered = rotation.evaluate()
+            self.assertEqual(recovered.action, "hold")
+            self.assertEqual(bank.on_duty(), "b1")
+            self.assertEqual(len(auditor.filter("rotation")), 1)
+
+    def test_release_if_duty_hands_off_before_backwash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, bank, _, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            self.assertEqual(rotation.evaluate().duty, "b1")
+            handoff = rotation.release_if_duty("b1")
+            self.assertIsNotNone(handoff)
+            self.assertEqual(handoff.action, "handoff")
+            self.assertEqual(bank.on_duty(), "b2")
+            self.assertIsNone(rotation.release_if_duty("b1"))
+            release = rotation.release_if_duty("b2")
+            self.assertEqual(release.action, "handoff")
+            self.assertEqual(bank.on_duty(), "b1")
+
+    def test_production_resets_after_backwash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store, bank, _, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            controller = Controller(bank, store)
+            self.assertEqual(rotation.record_production("b1", 40.0), 40.0)
+            self.assertEqual(rotation.production("b1"), 40.0)
+            controller.start("b1")
+            self.assertEqual(rotation.production("b1"), 0.0)
+            self.assertEqual(rotation.record_production("b1", 5.0), 5.0)
+
+    def test_rotation_state_and_describe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, _, _, rotation = self._rig(tmp, {"b1": 9.0, "b2": 1.0})
+            rotation.evaluate()
+            state = rotation.state()
+            self.assertEqual(state.duty, "b1")
+            self.assertEqual(len(state.candidates), 2)
+            self.assertEqual(state.last_decision.action, "assign")
+            self.assertEqual(state.min_dwell_seconds, 300.0)
+            self.assertEqual(state.load_tolerance, 0.5)
+            self.assertIn("duty=b1", rotation.describe())
 
 
 class QuotaCase(unittest.TestCase):

@@ -38,6 +38,8 @@ def text_report(rt: Runtime) -> str:
         f"filter bed_ids={rt.bank.bed_ids()}",
         f"backwash queue={telemetry.backwash_queue} drains={telemetry.backwash_drains}",
         f"backwash commands={rt.backwash.command_list()}",
+        f"rotation: {describe['rotation']}",
+        f"rotation ranked={rt.rotation.ranked()}",
         f"quota value={telemetry.quota_value:.4f} clearwell level={telemetry.clearwell_level:.4f}",
         f"coag ratio={telemetry.coag_ratio:.4f} chlorine target={telemetry.chlor_target:.4f}",
         (

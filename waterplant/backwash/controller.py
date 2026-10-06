@@ -67,14 +67,6 @@ class Controller:
             raise ValueError(f"no filter bed for zone {zone}")
         return mapping[zone]
 
-    def order_rotation(self) -> list[str]:
-        """Rotate duty to the dirtiest bed first."""
-
-        order = [bed.id for bed in sorted(self._bank.beds(), key=lambda bed: -bed.load)]
-        if order:
-            self._bank.rotate(order[0])
-        return order
-
     def eligible(self) -> list[str]:
         return [bed.id for bed in self._bank.beds() if not bed.closed]
 

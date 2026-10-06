@@ -37,10 +37,15 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
     rt.well.update_residual_demand(demand)
     chlor_dose = rt.chlor_doser.apply_residual() if ph_verdict.stable else 0.0
     min_level = rt.well.adjust_level(level, rt.inlet, rt.outlet)
-    rotation = rt.backwash.order_rotation()
-    duty = rt.bank.on_duty()
+    decision = rt.rotation.evaluate(trigger="cycle")
     if bed_id:
+        # Rotation yields to the wash: duty hands off before the bed closes.
+        rt.rotation.release_if_duty(bed_id)
         rt.backwash.start(bed_id)
+    duty = rt.bank.on_duty()
+    if duty:
+        # The duty bed carries the cycle's flow as produced volume.
+        rt.rotation.record_production(duty, flow)
     quota_value = rt.accumulator.add(amount)
 
     return json_response(
@@ -51,7 +56,10 @@ def run_cycle(rt: Runtime, request: Request) -> Response:
             "min_level": min_level,
             "level": rt.well.level(),
             "quota": quota_value,
-            "rotation": rotation,
+            "rotation": decision.ranked,
+            "rotation_action": decision.action,
+            "rotation_reason": decision.reason,
+            "rotation_changed": decision.changed,
             "on_duty": duty or "",
             "backwash": bed_id,
             "drains": rt.backwash.drain_count(),
